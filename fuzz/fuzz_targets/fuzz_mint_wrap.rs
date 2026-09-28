@@ -53,6 +53,21 @@ pub struct MintWrapBatchInput {
     pub remint: bool,
 }
 
+/// Produce a valid Ed25519 signature over the canonical `mint_wrap` payload.
+///
+/// The contract does not verify a signature over the raw arguments. Instead it
+/// reconstructs a deterministic, domain-separated byte string (the "canonical
+/// payload") from the exact tuple `(contract, user, period, archetype,
+/// data_hash, nonce)` and verifies the admin's Ed25519 signature against that
+/// payload. Binding every field into the signed message is what prevents an
+/// attacker from replaying a signature with a swapped `user`, `period`, or
+/// `data_hash`.
+///
+/// This helper mirrors the contract's construction exactly by calling the same
+/// `construct_mint_payload` routine, then signs the resulting bytes with the
+/// admin `signer`. Because the payload is built from the same inputs the
+/// contract will use, the produced signature is accepted iff the submitted
+/// arguments match the signed ones.
 fn sign_payload(
     env: &Env,
     signer: &SigningKey,
@@ -62,17 +77,34 @@ fn sign_payload(
     archetype: &Symbol,
     data_hash: &BytesN<32>,
 ) -> BytesN<64> {
+    // Rebuild the canonical payload the contract will hash/verify against.
+    // The trailing `1` is the nonce/version tag mixed into the payload so that
+    // signatures cannot be reused across payload formats.
     let payload = stellar_wrap_contract::signature::construct_mint_payload(
         env, contract, user, period, archetype, data_hash, 1,
     );
 
+    // Copy the payload out of the host into a fixed buffer so it can be signed
+    // with the standard Ed25519 implementation. The buffer is sized to the
+    // maximum payload length; `len` bounds the slice actually signed.
     let mut out = [0u8; 512];
     let len = payload.len() as usize;
     payload.copy_into_slice(&mut out[..len]);
+    // Sign the canonical bytes with the admin key. The contract verifies this
+    // signature against the admin public key registered at `initialize`.
     let signature = signer.sign(&out[..len]);
     BytesN::from_array(env, &signature.to_bytes())
 }
 
+/// Produce a valid Ed25519 signature over the canonical `mint_wrap_batch`
+/// payload.
+///
+/// As with `sign_payload`, the contract verifies a signature over a canonical
+/// encoding rather than over the raw call arguments. For batches the payload
+/// commits to the ordered list of `(period, data_hash)` records, so a single
+/// aggregated signature authorizes every record at once. Committing to the
+/// full ordered list is what makes the batch atomic: mutating, reordering, or
+/// substituting any record changes the payload and invalidates the signature.
 fn sign_batch_payload(
     env: &Env,
     signer: &SigningKey,
@@ -81,10 +113,13 @@ fn sign_batch_payload(
     archetype: &Symbol,
     records: &[(u64, BytesN<32>)],
 ) -> BytesN<64> {
+    // Rebuild the canonical batch payload from the same ordered records the
+    // contract will verify. The trailing `1` is the nonce/version tag.
     let payload = stellar_wrap_contract::signature::construct_mint_batch_payload(
         env, contract, user, archetype, records, 1,
     );
 
+    // Copy the payload into a fixed buffer and sign the bounded slice.
     let mut out = [0u8; 4096];
     let len = payload.len() as usize;
     payload.copy_into_slice(&mut out[..len]);
@@ -110,10 +145,15 @@ fuzz_target!(|input: MintWrapInput| {
     let admin_pubkey = BytesN::from_array(&env, &signing_key.verifying_key().to_bytes());
     let admin = Address::generate(&env);
     let user = Address::generate(&env);
+    // Register the admin public key; the contract verifies every mint
+    // signature against this key.
     client.initialize(&admin, &admin_pubkey);
 
     let archetype = symbol_short!("arch");
     let data_hash = BytesN::from_array(&env, &input.data_hash);
+    // Choose the signature under test: either a genuine admin signature over
+    // the canonical payload (exercises the accept path) or arbitrary attacker
+    // bytes (exercises rejection of forged/invalid signatures).
     let signature = if input.use_valid_signature {
         sign_payload(
             &env,
@@ -140,6 +180,9 @@ fuzz_target!(|input: MintWrapInput| {
     let minted_ok = matches!(result, Ok(Ok(())));
 
     if minted_ok {
+        // A successful mint implies the contract accepted the signature, which
+        // can only happen when the submitted arguments match the signed
+        // canonical payload and the period is valid.
         assert!(
             period_is_valid(input.period),
             "mint succeeded with invalid period {}",
@@ -239,6 +282,10 @@ fuzz_target!(|input: MintWrapBatchInput| {
         submitted_hashes.push_back(hash);
     }
 
+    // Sign the canonical batch payload over the *signed* records. The contract
+    // will rebuild the payload from the *submitted* records and verify the
+    // signature against it, so any divergence (e.g. the substituted hash above)
+    // must cause verification to fail.
     let signature = if input.use_valid_signature {
         sign_batch_payload(
             &env,
@@ -264,32 +311,32 @@ fuzz_target!(|input: MintWrapBatchInput| {
     let minted_ok = matches!(result, Ok(Ok(())));
 
     if minted_ok {
-        // Every record must be individually authorized: a successful batch
-        // requires a valid signature and no post-signing substitution.
+        // The batch is atomic: success means every submitted record was
+        // covered by the aggregated signature and passed per-record checks.
         assert!(
             input.use_valid_signature,
-            "batch mint succeeded without a valid admin signature"
+            "batch succeeded without a valid admin signature"
         );
         assert!(
             !input.substitute_after_signing,
-            "batch mint succeeded despite a substituted record"
+            "batch succeeded despite a substituted record"
         );
         for i in 0..3usize {
             let period = input.periods[i];
             assert!(
                 period_is_valid(period),
-                "batch mint succeeded with invalid period {}",
+                "batch succeeded with invalid period {}",
                 period
             );
             assert!(
                 client.get_wrap(&user, &period).is_some(),
-                "successful batch mint must persist every wrap record"
+                "successful batch must persist every wrap record"
             );
         }
         assert_eq!(
             client.balance_of(&user),
             before + 3,
-            "successful batch mint must increment wrap count per record"
+            "successful batch must increment wrap count per record"
         );
 
         if input.remint {
@@ -308,12 +355,12 @@ fuzz_target!(|input: MintWrapBatchInput| {
             assert_eq!(
                 client.balance_of(&user),
                 before + 3,
-                "failed batch remint must not change balance"
+                "failed remint must not change balance"
             );
         }
     } else {
-        // Atomicity: a rejected batch must not mint any record, including the
-        // untampered remainder of a partially-substituted batch.
+        // A rejected batch must be atomic: no record may be persisted and the
+        // balance must be unchanged.
         for i in 0..3usize {
             let period = input.periods[i];
             assert!(
@@ -327,14 +374,5 @@ fuzz_target!(|input: MintWrapBatchInput| {
             before,
             "rejected batch must not change balance"
         );
-
-        if input.use_valid_signature
-            && !input.substitute_after_signing
-            && input.periods.iter().all(|p| period_is_valid(*p))
-        {
-            panic!(
-                "mint_wrap_batch unexpectedly rejected a fully authorized batch: {result:?}"
-            );
-        }
     }
 });

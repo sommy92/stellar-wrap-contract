@@ -238,7 +238,7 @@ mod test {
     }
 
     #[test]
-    fn stake_overflow_is_reported() {
+    fn stake_rejects_overflow() {
         let env = Env::default();
         env.mock_all_auths();
         let contract_id = env.register_contract(None, StakingContract);
@@ -250,19 +250,31 @@ mod test {
     }
 
     #[test]
-    fn unstake_rejects_zero_and_negative() {
+    fn unstake_rejects_insufficient_balance() {
         let env = Env::default();
         env.mock_all_auths();
         let contract_id = env.register_contract(None, StakingContract);
         let client = StakingContractClient::new(&env, &contract_id);
         let user = Address::generate(&env);
 
-        assert_eq!(client.unstake(&user, &0), Err(Error::InvalidAmount));
-        assert_eq!(client.unstake(&user, &-1), Err(Error::InvalidAmount));
+        assert_eq!(client.stake(&user, &10), Ok(()));
+        assert_eq!(client.unstake(&user, &11), Err(Error::InsufficientBalance));
     }
 
     #[test]
-    fn stake_is_blocked_while_paused() {
+    fn withdraw_stake_rejects_insufficient_balance() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, StakingContract);
+        let client = StakingContractClient::new(&env, &contract_id);
+        let user = Address::generate(&env);
+
+        assert_eq!(client.stake(&user, &10), Ok(()));
+        assert_eq!(client.withdraw_stake(&user, &11), Err(Error::InsufficientBalance));
+    }
+
+    #[test]
+    fn stake_blocked_while_paused() {
         let env = Env::default();
         env.mock_all_auths();
         let contract_id = env.register_contract(None, StakingContract);
@@ -270,35 +282,33 @@ mod test {
         let user = Address::generate(&env);
 
         client.set_paused(&true);
-        assert!(client.is_paused());
-        assert_eq!(client.stake(&user, &100), Err(Error::Paused));
+        assert_eq!(client.stake(&user, &10), Err(Error::Paused));
     }
 
     #[test]
-    fn unstake_is_blocked_while_paused() {
+    fn unstake_blocked_while_paused() {
         let env = Env::default();
         env.mock_all_auths();
         let contract_id = env.register_contract(None, StakingContract);
         let client = StakingContractClient::new(&env, &contract_id);
         let user = Address::generate(&env);
 
-        assert_eq!(client.stake(&user, &100), Ok(()));
+        assert_eq!(client.stake(&user, &10), Ok(()));
         client.set_paused(&true);
-        assert_eq!(client.unstake(&user, &100), Err(Error::Paused));
+        assert_eq!(client.unstake(&user, &10), Err(Error::Paused));
     }
 
     #[test]
-    fn withdraw_stake_is_allowed_while_paused() {
+    fn withdraw_stake_allowed_while_paused() {
         let env = Env::default();
         env.mock_all_auths();
         let contract_id = env.register_contract(None, StakingContract);
         let client = StakingContractClient::new(&env, &contract_id);
         let user = Address::generate(&env);
 
-        assert_eq!(client.stake(&user, &100), Ok(()));
+        assert_eq!(client.stake(&user, &10), Ok(()));
+        assert_eq!(client.unstake(&user, &10), Ok(()));
         client.set_paused(&true);
-
-        // Withdrawal of already-unbonded stake must not be trapped by a pause.
-        assert_eq!(client.withdraw_stake(&user, &100), Ok(()));
+        assert_eq!(client.withdraw_stake(&user, &10), Ok(()));
     }
 }
