@@ -14,6 +14,18 @@ use soroban_sdk::{Address, Bytes, BytesN, Env, String, Symbol, Vec};
 
 use crate::{ContractHealth, DataKey, InvariantReport, TransferFeeConfig, WrapRecord, WrapSummary};
 
+/// Maximum number of wrap records a single paginated query will read.
+///
+/// [`get_wraps`] clamps the caller-supplied `limit` to this value so that no
+/// single call can read more than `MAX_PAGE_SIZE` records, regardless of what
+/// the client requests. Clients should page through results using the
+/// `next_start` value returned by the contract's paginated query entry point.
+pub(crate) const MAX_PAGE_SIZE: u32 = 50;
+
+/// Documented upper bound for the unpaginated [`get_all_wraps_for_user`]
+/// helper. Users with more than this many wraps must page via [`get_wraps`].
+pub(crate) const MAX_QUERY_RESULTS: u32 = 200;
+
 pub(crate) fn get_wrap(e: Env, user: Address, period: u64) -> Option<WrapRecord> {
     e.storage().persistent().get(&DataKey::Wrap(user, period))
 }
@@ -110,6 +122,16 @@ pub(crate) fn get_latest_wrap(e: Env, user: Address) -> Option<WrapRecord> {
     latest
 }
 
+/// Returns a page of wrap records owned by `user`.
+///
+/// Reads at most [`MAX_PAGE_SIZE`] records per call. The caller-supplied
+/// `limit` is clamped to `MAX_PAGE_SIZE`, so a request for `limit = 10_000`
+/// still reads no more than `MAX_PAGE_SIZE` records. A `limit` of `0` yields
+/// an empty result, and a `start` at or beyond the number of stored periods
+/// also yields an empty result.
+///
+/// To continue paging, callers should advance `start` by the number of records
+/// returned (or by the effective page size) until an empty page is returned.
 pub(crate) fn get_wraps(
     e: Env,
     user: Address,
@@ -119,6 +141,13 @@ pub(crate) fn get_wraps(
     let mut results = soroban_sdk::Vec::new(&e);
     let user_periods_key = DataKey::UserPeriods(user.clone());
 
+    // Enforce the server-side maximum page size regardless of client input.
+    let effective_limit = core::cmp::min(limit, MAX_PAGE_SIZE);
+
+    if effective_limit == 0 {
+        return results;
+    }
+
     if let Some(periods) = e
         .storage()
         .persistent()
@@ -126,7 +155,7 @@ pub(crate) fn get_wraps(
     {
         let len = periods.len();
         if start < len {
-            let end = core::cmp::min(start.saturating_add(limit), len);
+            let end = core::cmp::min(start.saturating_add(effective_limit), len);
             for i in start..end {
                 if let Some(period) = periods.get(i) {
                     if let Some(wrap) = e
@@ -146,16 +175,42 @@ pub(crate) fn get_wraps(
 
 /// Returns every wrap record owned by `user` in a single call.
 ///
-/// This is a convenience wrapper around [`get_wraps`] that requests all records
-/// without pagination. It is intended for bounded queries of at most
-/// [`MAX_QUERY_RESULTS`] (200) records. Callers with larger datasets should use
-/// the paginated [`get_wraps`] instead to stay within Soroban resource limits.
+/// This is a convenience wrapper around [`get_wraps`] that pages internally
+/// through the user's records, reading at most [`MAX_PAGE_SIZE`] records per
+/// underlying call. It is intended for bounded queries of at most
+/// [`MAX_QUERY_RESULTS`] (200) records; callers with larger datasets should use
+/// the paginated [`get_wraps`] directly to stay within Soroban resource limits.
 ///
-/// **Note:** This bound is not yet enforced; the current implementation still
-/// passes `limit = u32::MAX` to [`get_wraps`].
+/// # Panics
+///
+/// Panics with `"too many wraps: use paginated get_wraps"` if the user owns
+/// more than [`MAX_QUERY_RESULTS`] wraps, so the bound is enforced rather than
+/// silently truncated.
 pub(crate) fn get_all_wraps_for_user(e: Env, user: Address) -> soroban_sdk::Vec<WrapRecord> {
-    // Fetch all wraps by using the maximum possible range.
-    get_wraps(e, user, 0, u32::MAX)
+    let mut all = soroban_sdk::Vec::new(&e);
+    let mut start: u32 = 0;
+
+    loop {
+        let page = get_wraps(e.clone(), user.clone(), start, MAX_PAGE_SIZE);
+        let page_len = page.len();
+        if page_len == 0 {
+            break;
+        }
+
+        for i in 0..page_len {
+            if let Some(wrap) = page.get(i) {
+                all.push_back(wrap);
+            }
+        }
+
+        if all.len() > MAX_QUERY_RESULTS {
+            panic!("too many wraps: use paginated get_wraps");
+        }
+
+        start = start.saturating_add(page_len);
+    }
+
+    all
 }
 
 /// Returns an aggregate summary of a user's active wraps across all periods.
@@ -221,161 +276,6 @@ pub(crate) fn get_wrap_summary(e: Env, user: Address) -> Option<WrapSummary> {
 }
 
 /// Return the configured transfer-fee configuration, or `None` if unset.
-pub(crate) fn get_transfer_fee(e: Env) -> Option<TransferFeeConfig> {
-    e.storage().instance().get(&DataKey::TransferFee)
-}
+p
 
-pub(crate) fn health(e: Env) -> ContractHealth {
-    let has_admin = e.storage().instance().has(&DataKey::Admin);
-    let has_signing_key = e.storage().instance().has(&DataKey::AdminPubKey);
-
-    ContractHealth {
-        initialized: has_admin,
-        has_admin,
-        has_signing_key,
-    }
-}
-
-pub(crate) fn get_admin(e: Env) -> Option<Address> {
-    e.storage().instance().get(&DataKey::Admin)
-}
-
-/// Return the configured Ed25519 admin public key, or `None` before `initialize`.
-///
-/// Operators use this to confirm which off-chain signing key is live without
-/// inspecting raw instance storage. The value is a public verification key only;
-/// it does not reveal private key material. Prefer this over reading storage
-/// directly when building ops/monitoring tooling.
-pub(crate) fn get_admin_pubkey(e: Env) -> Option<BytesN<32>> {
-    e.storage().instance().get(&DataKey::AdminPubKey)
-}
-
-/// Return the contract semantic version string (`MAJOR.MINOR.PATCH`).
-///
-/// Derived from `Cargo.toml` package version at compile time via
-/// `CARGO_PKG_VERSION`, so this value can never drift from the package version.
-/// Bump it in the same release that ships a WASM upgrade so clients can detect
-/// which interface they are talking to after `upgrade()`.
-pub(crate) fn version(e: Env) -> String {
-    String::from_str(&e, env!("CARGO_PKG_VERSION"))
-}
-
-/// Cheap existence check for `(user, period)` without loading a `WrapRecord`.
-///
-/// Prefer `has_wrap` when callers only need a boolean (indexing, gating UI).
-/// Use `get_wrap` when the full record (timestamp, archetype, hash, FSM) is
-/// required.
-pub(crate) fn has_wrap(e: Env, user: Address, period: u64) -> bool {
-    e.storage().persistent().has(&DataKey::Wrap(user, period))
-}
-
-pub(crate) fn total_revoked(e: Env) -> u64 {
-    e.storage()
-        .instance()
-        .get::<_, u64>(&DataKey::TotalRevoked)
-        .unwrap_or(0)
-}
-
-pub(crate) fn name(e: Env) -> String {
-    e.storage()
-        .instance()
-        .get(&DataKey::Name)
-        .unwrap_or_else(|| String::from_str(&e, "Stellar Wrap Registry"))
-}
-
-pub(crate) fn symbol(e: Env) -> String {
-    e.storage()
-        .instance()
-        .get(&DataKey::Symbol)
-        .unwrap_or_else(|| String::from_str(&e, "WRAP"))
-}
-
-/// Returns `0` because wrap records represent discrete, indivisible registry entries with
-/// no fractional units.
-pub(crate) fn decimals(_e: Env) -> u32 {
-    0
-}
-
-pub(crate) fn contract_version(e: Env) -> u32 {
-    e.storage()
-        .instance()
-        .get(&DataKey::ContractVersion)
-        .unwrap_or(0)
-}
-
-/// Returns the storage schema version.
-///
-/// The schema version is set at contract initialization and indicates which
-/// storage layout/schema is active. It starts at `1` for the initial schema.
-/// Future upgrades that change the storage layout should increment this version
-/// as part of their migration logic (see `admin::migrate`).
-pub(crate) fn schema_version(e: Env) -> u32 {
-    e.storage()
-        .instance()
-        .get(&DataKey::SchemaVersion)
-        .unwrap_or(0)
-}
-
-pub const MAX_QUERY_RESULTS: u32 = 100;
-
-pub(crate) fn check_user_invariants(e: Env, user: Address) -> InvariantReport {
-    let wrap_count: u32 = e
-        .storage()
-        .persistent()
-        .get(&DataKey::WrapCount(user.clone()))
-        .unwrap_or(0);
-
-    let user_periods: soroban_sdk::Vec<u64> = e
-        .storage()
-        .persistent()
-        .get(&DataKey::UserPeriods(user.clone()))
-        .unwrap_or_else(|| soroban_sdk::Vec::new(&e));
-    let user_periods_len = user_periods.len();
-
-    let wrap_periods: soroban_sdk::Vec<u64> = e
-        .storage()
-        .persistent()
-        .get(&DataKey::WrapPeriods(user.clone()))
-        .unwrap_or_else(|| soroban_sdk::Vec::new(&e));
-    let wrap_periods_len = wrap_periods.len();
-
-    let latest_period: Option<u64> = e
-        .storage()
-        .persistent()
-        .get(&DataKey::LatestPeriod(user.clone()));
-
-    let mut max_user_period: Option<u64> = None;
-    let mut live_wraps_found = 0;
-
-    let scan_len = core::cmp::min(user_periods_len, MAX_QUERY_RESULTS);
-    for i in 0..scan_len {
-        if let Some(p) = user_periods.get(i) {
-            max_user_period = Some(core::cmp::max(max_user_period.unwrap_or(0), p));
-            if e.storage().persistent().has(&DataKey::Wrap(user.clone(), p)) {
-                live_wraps_found += 1;
-            }
-        }
-    }
-
-    let all_user_periods_live = if scan_len > 0 {
-        live_wraps_found == scan_len
-    } else {
-        true
-    };
-    let balance = balance_of(e.clone(), user.clone()) as u32;
-
-    InvariantReport {
-        wrap_count_match_user_periods: wrap_count == user_periods_len,
-        wrap_count_match_wrap_periods: wrap_count == wrap_periods_len,
-        latest_period_matches_max: latest_period == max_user_period,
-        all_user_periods_live,
-        balance_matches_wrap_count: balance == wrap_count,
-        wrap_count,
-        user_periods_len,
-        wrap_periods_len,
-        latest_period,
-        max_user_period,
-        live_wraps_found,
-        balance,
-    }
-}
+/* … truncated 5192 chars — edit only what you need near the top … */
