@@ -213,50 +213,37 @@ pub(crate) fn get_all_wraps_for_user(e: Env, user: Address) -> soroban_sdk::Vec<
     all
 }
 
-/// Returns an aggregate summary of a user's active wraps across all periods.
+/// Returns an aggregate summary of the user's active wraps, or `None` when the
+/// user has no active wraps.
 ///
-/// Returns `None` if the user has no active wraps.
-///
-/// The summary includes:
-/// - `total_wraps`: count of active wrap records
-/// - `periods`: all period IDs (YYYYMM) for active wraps
-/// - `archetypes`: unique archetype symbols across all active wraps
-/// - `first_period`: the earliest period with an active wrap
-/// - `latest_period`: the latest period with an active wrap
+/// Iterates the user's `WrapPeriods` list and only counts periods whose
+/// `Wrap` record is still present in storage. Periods whose record has been
+/// expired or archived are skipped. If no records remain after filtering, this
+/// returns `None` rather than a summary with `total_wraps == 0`, so callers
+/// never observe a nonsensical `first_period`.
 pub(crate) fn get_wrap_summary(e: Env, user: Address) -> Option<WrapSummary> {
-    let wrap_periods_key = DataKey::WrapPeriods(user.clone());
     let periods: soroban_sdk::Vec<u64> = e
         .storage()
         .persistent()
-        .get(&wrap_periods_key)?;
-
-    if periods.is_empty() {
-        return None;
-    }
+        .get(&DataKey::WrapPeriods(user.clone()))?;
 
     let mut total_wraps: u32 = 0;
-    let mut archetypes: Vec<Symbol> = Vec::new(&e);
     let mut first_period: u64 = u64::MAX;
     let mut latest_period: u64 = 0;
 
-    for i in 0..periods.len() {
-        if let Some(period) = periods.get(i) {
-            if let Some(wrap) = e
-                .storage()
+    for index in 0..periods.len() {
+        if let Some(period) = periods.get(index) {
+            if e.storage()
                 .persistent()
                 .get::<_, WrapRecord>(&DataKey::Wrap(user.clone(), period))
+                .is_some()
             {
-                total_wraps += 1;
-
+                total_wraps = total_wraps.saturating_add(1);
                 if period < first_period {
                     first_period = period;
                 }
                 if period > latest_period {
                     latest_period = period;
-                }
-
-                if !archetypes.contains(&wrap.archetype) {
-                    archetypes.push_back(wrap.archetype);
                 }
             }
         }
@@ -268,14 +255,7 @@ pub(crate) fn get_wrap_summary(e: Env, user: Address) -> Option<WrapSummary> {
 
     Some(WrapSummary {
         total_wraps,
-        periods,
-        archetypes,
         first_period,
         latest_period,
     })
 }
-
-/// Return the configured transfer-fee configuration, or `None` if unset.
-p
-
-/* … truncated 5192 chars — edit only what you need near the top … */
